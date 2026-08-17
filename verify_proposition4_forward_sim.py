@@ -1,7 +1,12 @@
 """
-Proposition 4 — sequential forward simulation along an exogenous trust path.
+Proposition 4 — sequential forward simulation along an exogenous trust path
+(lambda / λ sweep variant).
 
-Complement to Prop4/verify_proposition4.py (tau-slice / NPL shock). Trust follows
+Same methodology as prop4_forward_sim/ (forced τ all states, t=0 NPL under
+forced τ̄, t>0 warm-start NPL with frozen P^H_0, overall rates). This folder
+sweeps lam (λ) with delta and psi fixed — does not modify prop4_forward_sim/.
+
+Trust follows
 
     tau_t = max(0, tau_bar - t),   t = 0, 1, ..., T_max
 
@@ -12,7 +17,7 @@ At EVERY t (including t=0), every state's τ coordinate is forced to τ_t:
   - Transitions: mean-field CCP looked up at (x,A_L,A_H,τ_t,T); next τ pinned
     to τ_t. Only (x, A_L, A_H, T) vary. No model.py change.
 
-Procedure (per delta):
+Procedure (per lam; delta=DELTA_FIXED=3.0, psi=PSI_FIXED=0.5):
   t=0  — Multi-init NPL P^H under forced τ=τ̄ for all states (local forced-τ
          NPL, not heterogeneous state-τ payoffs). Record overall CCP means.
          Store competitor adoption environment = P^H_0.
@@ -24,15 +29,15 @@ Honesty note: sequential NPL along an exogenous tau path with frozen
 competitors — not a full closed-loop rational-expectations path.
 
 Usage (from simulation/):
-    python prop4_forward_sim/verify_proposition4_forward_sim.py
-    python prop4_forward_sim/verify_proposition4_forward_sim.py --delta 2.0 3.0
-    python prop4_forward_sim/verify_proposition4_forward_sim.py --n-br 100
-    python prop4_forward_sim/verify_proposition4_forward_sim.py --plot-only
+    python prop4_forward_sim_lambda/verify_proposition4_forward_sim.py
+    python prop4_forward_sim_lambda/verify_proposition4_forward_sim.py --lam 1.5 2.0 3.0
+    python prop4_forward_sim_lambda/verify_proposition4_forward_sim.py --n-br 100
+    python prop4_forward_sim_lambda/verify_proposition4_forward_sim.py --plot-only
 
 Output (defaults under this folder):
-    prop4_forward_sim/prop4_forward_sim_verification.txt
-    prop4_forward_sim/figures/prop4_forward_rates_vs_t.{png,pdf}
-    prop4_forward_sim/figures/prop4_forward_rates_vs_t_delta{d}.{png,pdf}
+    prop4_forward_sim_lambda/prop4_forward_sim_verification.txt
+    prop4_forward_sim_lambda/figures/prop4_forward_rates_vs_t.{png,pdf}
+    prop4_forward_sim_lambda/figures/prop4_forward_rates_vs_t_lam{p}.{png,pdf}
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ from model import (
     A_AGENT,
     A_HITL,
     A_NONE,
+    ModelParams,
 )
 from npl import (
     choice_probs_from_values,
@@ -74,7 +80,6 @@ from verify_equilibrium_existence import (
     NPL_DAMPING,
     NPL_MAX_ITER,
     NPL_TOL,
-    PSI_FIXED,
     RESIDUAL_VF_ITER,
     ccp_distance,
     compute_equilibrium_stats,
@@ -86,7 +91,7 @@ from verify_equilibrium_existence import (
 def _load_prop4_module():
     """Load Prop4/verify_proposition4.py helpers (Prop4/ is not a package)."""
     path = os.path.join(PROP4_DIR, "verify_proposition4.py")
-    name = "verify_proposition4_for_forward_sim"
+    name = "verify_proposition4_for_forward_sim_lambda"
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load Prop4 script: {path}")
@@ -97,19 +102,37 @@ def _load_prop4_module():
 
 _prop4 = _load_prop4_module()
 AGENT_SWITCH_THRESH = _prop4.AGENT_SWITCH_THRESH
-DELTA_VALUES = _prop4.DELTA_VALUES
 MU_C = _prop4.MU_C
-build_params_for_delta = _prop4.build_params_for_delta
 detect_switch_tau = _prop4.detect_switch_tau
 build_aggressive_init = _prop4.build_aggressive_init
 tau_slice_stats = _prop4.tau_slice_stats
 format_equilibrium_stats = _prop4.format_equilibrium_stats
+
+# Outer sweep is over lam (λ); delta and psi fixed.
+DELTA_FIXED = 3.0
+PSI_FIXED = 0.5
+# Baseline ModelParams.lam = 1.5. Grid starts at baseline and sweeps upward
+# (stronger agent trust weight lam * g_tau relative to HITL/NONE mu_* * g_tau).
+LAM_VALUES = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 
 OUTPUT_TXT = os.path.join(SCRIPT_DIR, "prop4_forward_sim_verification.txt")
 FIGDIR = Path(SCRIPT_DIR) / "figures"
 
 # t>0: dampened NPL to convergence vs frozen P^H_0 (not a single weak BR).
 DEFAULT_N_BR = NPL_MAX_ITER
+
+
+def build_params_for_lam(lam: float) -> ModelParams:
+    """ModelParams for one lam — Prop4-local mu_C; delta/psi fixed."""
+    return ModelParams(
+        **BASE_PARAMS,
+        delta=DELTA_FIXED,
+        psi=PSI_FIXED,
+        lam=lam,
+        mu_C=MU_C,
+        delta_x_base=DELTA_X_BASE,
+        delta_x_comp=DELTA_X_COMP,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +677,8 @@ def run_sequential_path(
     }
 
 
-def run_delta_forward(
-    delta: float,
+def run_lam_forward(
+    lam: float,
     ss,
     N_C: int,
     N_G: int,
@@ -666,16 +689,17 @@ def run_delta_forward(
     tol: float = NPL_TOL,
 ) -> Dict[str, Any]:
     """t=0: forced-τ NPL P^H; t>0: NPL vs frozen P^H_0 with forced-τ payoffs+F."""
-    params = build_params_for_delta(delta)
+    params = build_params_for_lam(lam)
     tau_bar = int(params.tau_bar)
     schedule = tau_schedule(tau_bar, t_max=t_max)
     tau0 = int(schedule[0][1])  # = tau_bar at t=0
 
-    log_lines.append(f"[ delta = {delta} ]")
+    log_lines.append(f"[ lam = {lam} ]")
     log_lines.append(
-        f"  Parameters: psi={PSI_FIXED}, N={params.N}, mu_C={MU_C}, "
-        f"delta_x_base={DELTA_X_BASE}, delta_x_comp={DELTA_X_COMP}, "
-        f"tau_bar={tau_bar}"
+        f"  Parameters: lam={lam}, delta={DELTA_FIXED}, psi={PSI_FIXED}, "
+        f"N={params.N}, mu_C={MU_C}, mu_G={params.mu_G}, "
+        f"delta_x_base={DELTA_X_BASE}, "
+        f"delta_x_comp={DELTA_X_COMP}, tau_bar={tau_bar}"
     )
     log_lines.append(
         f"  Tau schedule: tau_t = max(0, {tau_bar} - t); "
@@ -708,7 +732,7 @@ def run_delta_forward(
         log_lines.append("  Forward sim SKIPPED (no P^H from forced-τ NPL).")
         log_lines.append("")
         return {
-            "delta": delta,
+            "lam": lam,
             "ph_exists": False,
             "path_rows": [],
             "switch_C": np.nan,
@@ -803,14 +827,14 @@ def run_delta_forward(
     log_lines.append("")
 
     print(
-        f"[ delta = {delta} ]  sequential forward done — "
+        f"[ lam = {lam} ]  sequential forward done — "
         f"n_br_max={n_br} (t>0), T_end={schedule[-1][0]}, "
         f"C-first={'Yes' if c_first else 'No'}",
         flush=True,
     )
 
     return {
-        "delta": delta,
+        "lam": lam,
         "ph_exists": True,
         "path_rows": path_rows,
         "switch_C": switch_C,
@@ -823,26 +847,33 @@ def run_delta_forward(
 
 def run_forward_sweep(
     log_lines: List[str],
-    delta_values=None,
+    lam_values=None,
     t_max: Optional[int] = None,
     n_br: int = DEFAULT_N_BR,
     damping: float = NPL_DAMPING,
     tol: float = NPL_TOL,
 ) -> List[Dict[str, Any]]:
-    if delta_values is None:
-        delta_values = DELTA_VALUES
+    if lam_values is None:
+        lam_values = LAM_VALUES
 
-    ss, N_C, N_G, _inits = make_sweep_context()
+    ss, N_C, N_G, _inits = make_sweep_context(delta=DELTA_FIXED)
     tau_bar = int(BASE_PARAMS["tau_bar"])
 
     log_lines.append(
-        "PROPOSITION 4 FORWARD SIM: forced-τ all states every t; "
+        "PROPOSITION 4 FORWARD SIM (λ sweep): forced-τ all states every t; "
         "t=0 NPL P^H + t>0 NPL (frozen P^H_0 comps)"
     )
     log_lines.append("=" * 105)
     log_lines.append(
-        f"Fixed parameters: psi={PSI_FIXED}, mu_C={MU_C}, "
-        f"delta_x_base={DELTA_X_BASE}, delta_x_comp={DELTA_X_COMP}"
+        f"Fixed parameters: delta={DELTA_FIXED}, psi={PSI_FIXED}, "
+        f"mu_C={MU_C}, delta_x_base={DELTA_X_BASE}, "
+        f"delta_x_comp={DELTA_X_COMP}"
+    )
+    log_lines.append(f"Lambda (lam) sweep: {list(lam_values)}")
+    log_lines.append(
+        "Rationale: ModelParams.lam default=1.5 (agent trust weight); "
+        f"Prop4 mu_C={MU_C}, model mu_G=0.5. Grid starts at baseline and "
+        "sweeps upward (lam ∈ {baseline, …, ~3×baseline})."
     )
     log_lines.append(
         f"State space (DEV_MODE={DEV_MODE}): "
@@ -888,19 +919,19 @@ def run_forward_sweep(
     log_lines.append("")
 
     summary_rows = []
-    for delta in delta_values:
-        print(f"[ delta = {delta} ]  running sequential forward sim...", flush=True)
-        row = run_delta_forward(
-            delta, ss, N_C, N_G, log_lines,
+    for lam in lam_values:
+        print(f"[ lam = {lam} ]  running sequential forward sim...", flush=True)
+        row = run_lam_forward(
+            lam, ss, N_C, N_G, log_lines,
             t_max=t_max, n_br=n_br, damping=damping, tol=tol,
         )
         summary_rows.append(row)
 
     log_lines.append("=" * 105)
-    log_lines.append("TABLE: Proposition 4 Forward-Sim Summary")
+    log_lines.append("TABLE: Proposition 4 Forward-Sim Summary (λ sweep)")
     log_lines.append("-" * 105)
     header = (
-        f"{'delta':<7}| {'P^H?':<6}| {'sw_C':<5}| {'sw_G':<5}| "
+        f"{'lam':<7}| {'P^H?':<6}| {'sw_C':<5}| {'sw_G':<5}| "
         f"{'C 1st?':<7}| baseline agent (C/G)"
     )
     log_lines.append(header)
@@ -922,7 +953,7 @@ def run_forward_sweep(
             else "N/A"
         )
         log_lines.append(
-            f"{row['delta']:<7.1f}| "
+            f"{row['lam']:<7.1f}| "
             f"{str(row['ph_exists']):<6}| "
             f"{sw_C:<5}| {sw_G:<5}| "
             f"{str(row.get('c_switches_first', False)):<7}| "
@@ -937,16 +968,17 @@ def run_forward_sweep(
 # ---------------------------------------------------------------------------
 
 def parse_forward_txt(text: str) -> Dict[str, Any]:
-    """Parse prop4_forward_sim_verification.txt into blocks with path rows."""
+    """Parse prop4_forward_sim_verification.txt into lam blocks with path rows."""
     block_pat = re.compile(
-        r"\[\s*delta\s*=\s*([0-9.]+)\s*\](.*?)(?=\[\s*delta\s*=|\n={10,}|\Z)",
+        r"\[\s*(lam|lambda|psi|delta)\s*=\s*([0-9.]+)\s*\](.*?)(?=\[\s*(?:lam|lambda|psi|delta)\s*=|\n={10,}|\Z)",
         re.S | re.I,
     )
 
     blocks = []
     for m in block_pat.finditer(text):
-        d = float(m.group(1))
-        body = m.group(2)
+        key = m.group(1).lower()
+        val = float(m.group(2))
+        body = m.group(3)
         path_rows = []
         in_path = False
         for line in body.splitlines():
@@ -979,7 +1011,16 @@ def parse_forward_txt(text: str) -> Dict[str, Any]:
                     })
             except ValueError:
                 continue
-        blocks.append({"delta": d, "path": path_rows})
+        blk: Dict[str, Any] = {"path": path_rows}
+        if key in ("lam", "lambda"):
+            blk["lam"] = val
+        elif key == "psi":
+            blk["psi"] = val
+            blk["lam"] = val  # legacy fallback for plot key
+        else:
+            blk["delta"] = val
+            blk["lam"] = val
+        blocks.append(blk)
     return {"blocks": blocks}
 
 
@@ -989,9 +1030,9 @@ def plot_forward_results(
     overlay_slice: bool = False,  # kept for CLI compat; unused (old Option A removed)
 ) -> List[Path]:
     """
-    Plot C/G agent & HITL CCP-mean rates vs t for each delta.
+    Plot C/G agent & HITL CCP-mean rates vs t for each lam.
 
-    Saves under prop4_forward_sim/figures/prop4_forward_*.
+    Saves under prop4_forward_sim_lambda/figures/prop4_forward_*.
     """
     del overlay_slice  # old Option-A overlay removed
     import matplotlib
@@ -1004,10 +1045,10 @@ def plot_forward_results(
 
     blocks = sorted(
         [b for b in data.get("blocks", []) if b.get("path")],
-        key=lambda b: b["delta"],
+        key=lambda b: b.get("lam", b.get("psi", b.get("delta", 0.0))),
     )
     if not blocks:
-        print("  [warn] Prop4 forward: no path blocks to plot")
+        print("  [warn] Prop4 forward (λ): no path blocks to plot")
         return []
 
     rate_lab = (
@@ -1034,6 +1075,7 @@ def plot_forward_results(
     for i, blk in enumerate(blocks):
         ax = axes_flat[i]
         rows = blk["path"]
+        lam_val = blk.get("lam", blk.get("psi", blk.get("delta")))
         ts = [r["t"] for r in rows]
         ax.plot(
             ts, [r["agent_C"] for r in rows], "o-",
@@ -1055,7 +1097,7 @@ def plot_forward_results(
         tau_ann = ", ".join(f"t{r['t']}→τ{r['tau_t']}" for r in rows[:4])
         if len(rows) > 4:
             tau_ann += ", …"
-        ax.set_title(rf"$\delta$={blk['delta']}" + f"\n({tau_ann})", fontsize=10)
+        ax.set_title(rf"$\lambda$={lam_val}" + f"\n({tau_ann})", fontsize=10)
         ax.set_xlabel(r"$t$")
         if i % ncols == 0:
             ax.set_ylabel("CCP mean rate")
@@ -1068,9 +1110,10 @@ def plot_forward_results(
         axes_flat[j].set_visible(False)
 
     fig.suptitle(
-        r"Prop 4 forward: C/G agent & HITL vs $t$"
+        r"Prop 4 forward ($\lambda$ sweep): C/G agent \& HITL vs $t$"
         "\n"
-        rf"({rate_lab}; $t$=0 forced-$\tau$ NPL $P^H$; comps frozen; "
+        rf"({rate_lab}; $\delta$={DELTA_FIXED:g}, $\psi$={PSI_FIXED:g}; "
+        r"$t$=0 forced-$\tau$ NPL $P^H$; comps frozen; "
         r"$\tau_t=\max(0,\bar\tau-t)$)",
         y=1.04,
     )
@@ -1085,6 +1128,7 @@ def plot_forward_results(
 
     for blk in blocks:
         rows = blk["path"]
+        lam_val = blk.get("lam", blk.get("psi", blk.get("delta")))
         fig, ax = plt.subplots(figsize=(6.5, 4.2))
         ts = [r["t"] for r in rows]
         ax.plot(ts, [r["agent_C"] for r in rows], "o-", color=colors["C"], label="agent(C)")
@@ -1102,15 +1146,16 @@ def plot_forward_results(
         ax.set_ylim(-0.05, 1.05)
         ax.set_title(
             rf"Prop 4 forward vs $t$ "
-            rf"($\delta$={blk['delta']}; {rate_lab})"
+            rf"($\lambda$={lam_val}, $\delta$={DELTA_FIXED:g}, "
+            rf"$\psi$={PSI_FIXED:g}; {rate_lab})"
         )
         ax.legend(fontsize=8, loc="best")
         ax.grid(True, alpha=0.3, linestyle="--")
         fig.tight_layout()
-        d_tag = str(blk["delta"]).replace(".", "p")
-        stem_d = f"prop4_forward_rates_vs_t_delta{d_tag}"
+        p_tag = str(lam_val).replace(".", "p")
+        stem_p = f"prop4_forward_rates_vs_t_lam{p_tag}"
         for ext in ("png", "pdf"):
-            p = figdir / f"{stem_d}.{ext}"
+            p = figdir / f"{stem_p}.{ext}"
             fig.savefig(p, bbox_inches="tight", dpi=150)
             paths.append(p)
             print(f"  wrote {p}")
@@ -1126,15 +1171,19 @@ def plot_forward_results(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Prop4 forward simulation: at every t force τ=τ_t on ALL states "
-            "(payoffs + transitions; only x,A_L,A_H,T vary). "
+            "Prop4 forward simulation (λ sweep): at every t force τ=τ_t on ALL "
+            "states (payoffs + transitions; only x,A_L,A_H,T vary). "
             "t=0 = multi-init NPL P^H under forced τ=τ̄; "
-            "t>0 = NPL vs frozen P^H_0 along tau_t = max(0, tau_bar - t)."
+            "t>0 = NPL vs frozen P^H_0 along tau_t = max(0, tau_bar - t). "
+            f"Outer sweep over lam; delta={DELTA_FIXED}, psi={PSI_FIXED} fixed."
         )
     )
     parser.add_argument(
-        "--delta", type=float, nargs="*", default=None,
-        help="Optional subset of delta values (default: Prop4 full grid).",
+        "--lam", type=float, nargs="*", default=None,
+        help=(
+            "Optional subset of lam (λ) values "
+            f"(default: {LAM_VALUES}; delta={DELTA_FIXED}, psi={PSI_FIXED})."
+        ),
     )
     parser.add_argument(
         "--t-max", type=int, default=None,
@@ -1175,7 +1224,8 @@ def main():
             sys.exit(1)
         with open(OUTPUT_TXT, "r", encoding="utf-8") as f:
             text = f.read()
-        if "NOT RUN" in text[:500].upper() and "[ delta =" not in text.lower():
+        head = text[:800]
+        if "NOT RUN" in head.upper() and "[ lam =" not in head.lower():
             print(
                 f"Results file is a NOT-RUN placeholder: {OUTPUT_TXT}\n"
                 "Run without --plot-only to produce sequential forward results."
@@ -1186,19 +1236,20 @@ def main():
         plot_forward_results(data)
         return
 
-    delta_values = args.delta if args.delta else DELTA_VALUES
+    lam_values = args.lam if args.lam else LAM_VALUES
 
     print("=" * 70)
     print(
-        "PROPOSITION 4: Forward Sim "
+        "PROPOSITION 4: Forward Sim (λ sweep) "
         "(forced-τ all states; t=0 NPL P^H; t>0 frozen P^H_0)"
     )
     print("=" * 70)
     print(
-        f"Parameters: psi={PSI_FIXED}, mu_C={MU_C}, "
-        f"delta_x_base={DELTA_X_BASE}, delta_x_comp={DELTA_X_COMP}"
+        f"Parameters: delta={DELTA_FIXED} (fixed), psi={PSI_FIXED} (fixed), "
+        f"mu_C={MU_C}, delta_x_base={DELTA_X_BASE}, "
+        f"delta_x_comp={DELTA_X_COMP}"
     )
-    print(f"Delta sweep: {delta_values}")
+    print(f"Lambda (lam) sweep: {lam_values}")
     print(
         f"DEV_MODE={DEV_MODE}  "
         f"(N={BASE_PARAMS['N']}, x_bar={BASE_PARAMS['x_bar']}, "
@@ -1215,7 +1266,7 @@ def main():
     log_lines: List[str] = []
     summary_rows = run_forward_sweep(
         log_lines,
-        delta_values=delta_values,
+        lam_values=lam_values,
         t_max=args.t_max,
         n_br=args.n_br,
         damping=args.damping,
@@ -1238,7 +1289,7 @@ def main():
         if not any(b.get("path") for b in data["blocks"]):
             data = {
                 "blocks": [
-                    {"delta": r["delta"], "path": r.get("path_rows", [])}
+                    {"lam": r["lam"], "path": r.get("path_rows", [])}
                     for r in summary_rows
                     if r.get("path_rows")
                 ],
